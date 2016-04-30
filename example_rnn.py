@@ -49,9 +49,9 @@ epoch = 0
 smooth_loss = None
 
 TO_OPTIMIZE = [Wxh, Whh, Bh, Why, By]
-
-
 learning_rate = 0.01
+
+
 
 
 
@@ -106,7 +106,7 @@ while True:
     # calculates and saves all the gradients
 
     for var in TO_OPTIMIZE:
-        var.value -= var.backprop(sess)*learning_rate
+        var.value -= np.clip(var.backprop(sess)*learning_rate, -0.1, 0.1)
 
 
     if not num%1000:
