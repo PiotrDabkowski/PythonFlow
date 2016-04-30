@@ -182,7 +182,6 @@ class sum_op(Operation):
     def __init__(self, a, b):
         self.involvements = []
 
-
         self.a = a
         self.b = b
         a.involvements.append((self, 0))
@@ -243,6 +242,29 @@ class element_mul_op(Operation):
         else:
             raise RuntimeError()
 
+class mask_select_op(Operation):
+    def __init__(self, a, mask):
+        if a.shape!=mask.shape:
+            raise ValueError("Mask must have the same shape as masked tensor!")
+        self.involvements = []
+        a.involvements.append((self, 0))
+        # fuck the mask, not involved
+        self.a = a
+        self.mask = mask
+        self.shape = ()
+
+    def perform(self, session):
+        return np.array(np.sum(self.a.get_value(session) * self.mask.get_value(session)))
+
+    def op_grads(self, nvar, session):
+        my_grad = self.backprop(session)
+        if my_grad is None:
+            return None
+        mask = session.get_session_definition(self.mask)
+        if nvar==0:
+            return mask*my_grad
+        else:
+            raise RuntimeError()
 
 
 
@@ -294,7 +316,7 @@ class exp_op(SingleVarOperation):
         if my_grad is None:
             return None
         if nvar==0:
-            return my_grad*np.exp(self.a.get_value(session))
+            return my_grad*np.exp(self.a.get_value(session))  #todo make that faster by taking value from already calculated output!
         else:
             raise RuntimeError()
 
@@ -396,7 +418,7 @@ class transpose_op(Operation):
         if my_grad is None:
             return None
         if nvar==0:
-            return -my_grad
+            return my_grad.T
         else:
             raise RuntimeError()
 
@@ -436,16 +458,15 @@ class relu_op(SingleVarOperation):
 
 class sigmoid_op(SingleVarOperation):
     def perform(self, session):
-        a = self.a.get_value(session)
-        return expit(a)
+        return expit(self.a)
 
     def op_grads(self, nvar, session):
         my_grad = self.backprop(session)
         if my_grad is None:
             return None
         if nvar==0:
-            a = session.get_session_definition(self.a)
-            return my_grad*a*(1-a)
+            out = expit(session.get_session_definition(self.a)) #todo make that faster by taking value from already calculated output!
+            return my_grad*out*(1-out)
         else:
             raise RuntimeError()
 
@@ -453,15 +474,15 @@ class sigmoid_op(SingleVarOperation):
 class tanh_op(SingleVarOperation):
     def perform(self, session):
         a = self.a.get_value(session)
-        return expit(a)
+        return np.tanh(a)
 
     def op_grads(self, nvar, session):
         my_grad = self.backprop(session)
         if my_grad is None:
             return None
         if nvar==0:
-            a = session.get_session_definition(self.a)
-            return my_grad*(1.0-np.sqrt(a))
+            out = np.tanh(session.get_session_definition(self.a))
+            return my_grad*(1.0-out**2)  #todo make that faster by taking value from already calculated output!
         else:
             raise RuntimeError()
 
@@ -515,22 +536,39 @@ class Session:
 
 
 if __name__=='__main__':
+    aim = np.array([[1, 0],
+                    [0, 1],
+                    [0, 0]])
     sess = Session()
 
-    a = Placeholder((3, 2))
+    inp = Placeholder((3, 2))
+    select = Constant(aim)
+    soft = softmax_op(inp)
+    loss = -mask_select_op(log_op(soft), select)
 
-    sess.define_in_session(a, np.random.randn(3, 2))
+    in_arr = np.random.randn(3, 2)
+    num = 0
+    while num<10000:
+        sess.reset()
+        sess.define_in_session(inp, in_arr)
+        ls = loss.get_value(sess)
+        sess._grads[loss] = np.array(1)
+        in_arr -= inp.backprop(sess)*0.01
 
-    soft = softmax_op(a)
+        if not num%1000:
+            print '-'*80
+            print 'Iteration', num, '. Loss:', ls
+            print soft.get_value(sess)
+            print
+        num+=1
 
-    loss = -log_op(soft[0,0]) -log_op(soft[1,1])
+    if np.sum(np.abs(soft.get_value(sess) - aim))< 0.08:
+        print 'Worked!'
+    else:
+        print 'Something wrong with your gradients...'
 
 
-    print loss.get_value(sess)
 
-    sess._grads[loss] = np.array(1)
-
-    print a.backprop(sess)
 
 
 
