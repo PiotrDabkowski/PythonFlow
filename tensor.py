@@ -1,26 +1,37 @@
 import numpy as np
-np.random.seed(10)
+from scipy.special import expit
 
 
-def broadcast_shape(a, b):
-    return a
+
+def broadcast_shape(shp1, shp2):
+    #magic_num = 11*12+1
+    try:
+       # to_magic = lambda x : tuple((e if e is not None else magic_num) for e in x)
+        #from_magic = lambda x: tuple((e if e!=magic_num else None) for e in x)
+        return np.broadcast(np.empty(shp1), np.empty(shp2)).shape
+    except ValueError:
+        raise ValueError("Arrays cannot be broadcasted - %s and %s " % (str(shp1), str(shp2)))
 
 
 def ensum_shape(like, grad):
     '''makes sure that the grad has the same shape as like!'''
-    if like.shape==grad.shape:
+    ls = like.shape
+    gs = grad.shape
+    if ls==gs:
         return grad
-    if len(like.shape)!=len(grad.shape):
-        raise RuntimeError('Unexpected broadcasting type')
     to_sum = []
     dim = 0
-    for a, b in zip(like.shape, grad.shape):
+    if len(ls)<len(gs):
+        lsex = [1]*(len(gs)-len(ls)) + list(ls)
+    else:
+        lsex = ls
+    for a, b in zip(lsex, gs):
         if a!=b:
             if a!=1:
-                raise RuntimeError("Unexpected broadcasting!")
+                raise RuntimeError("Weird broadcasting - %s and %s !" % (str(ls), str(gs)))
             to_sum.append(dim)
         dim += 1
-    return np.sum(grad, tuple(to_sum))
+    return np.sum(grad, tuple(to_sum)).reshape(ls)
 
 class TensorUndefined(Exception):
     pass
@@ -63,6 +74,10 @@ class Tensor:
                 return False
         return True
 
+    @property
+    def T(self):
+        return transpose_op(self)
+
 
 
 ##############################
@@ -84,7 +99,7 @@ class Variable(Tensor):
         self.involvements = []
         if isinstance(value, (float, int, long)):
             val  = np.array(value)
-        if isinstance(value, np.ndarray):
+        elif isinstance(value, np.ndarray):
             val = value
         elif isinstance(value, Constant):
             val = value.value
@@ -161,14 +176,12 @@ class matmul_op(Operation):
             return np.matmul(a.T, my_grad)
         else:
             raise RuntimeError()
-np.broadcast
 
 class sum_op(Operation):
     '''MatrixMultiplication2D'''
     def __init__(self, a, b):
         self.involvements = []
 
-        a.check_if_fits(b, throw=True)
 
         self.a = a
         self.b = b
@@ -184,8 +197,12 @@ class sum_op(Operation):
         my_grad = self.backprop(session)
         if my_grad is None:
             return None
-        if nvar==0 or nvar==1:
-            return my_grad
+        if nvar==0:
+            a = session.get_session_definition(self.a)
+            return ensum_shape(a, my_grad)
+        if nvar==1:
+            b = session.get_session_definition(self.b)
+            return ensum_shape(b, my_grad)
         else:
             raise RuntimeError()
 
@@ -199,8 +216,6 @@ class element_mul_op(Operation):
     '''element-wise multiplication'''
     def __init__(self, a, b):
         self.involvements = []
-
-       # a.check_if_fits(b, throw=True)4
 
         self.a = a
         self.b = b
@@ -217,8 +232,8 @@ class element_mul_op(Operation):
         my_grad = self.backprop(session)
         if my_grad is None:
             return None
-        a = self.a.get_value(session)
-        b = self.b.get_value(session)
+        a = session.get_session_definition(self.a)
+        b = session.get_session_definition(self.b)
         if nvar==0:
             cand = my_grad * b
             return ensum_shape(a, cand)
@@ -230,6 +245,7 @@ class element_mul_op(Operation):
 
 
 
+
 # Single arg ops ----
 class SingleVarOperation(Operation):
     def __init__(self, a):
@@ -237,6 +253,37 @@ class SingleVarOperation(Operation):
         a.involvements.append((self, 0))
         self.a = a
         self.shape = a.shape
+
+class index_op(Operation):
+    '''You can choose only a single value!!!'''
+    def __init__(self, a, idx):
+        try:
+            np.zeros(a.shape)[idx]
+        except:
+            raise ValueError("Shape of indexed tensor must be known! Also index must be valid")
+        self.involvements = []
+        a.involvements.append((self, 0))
+        self.index = idx
+        self.a = a
+        self.shape = ()
+
+    def perform(self, session):
+        a = self.a.get_value(session)
+        return np.array( a[self.index] )
+
+    def op_grads(self, nvar, session):
+        my_grad = self.backprop(session)
+        if my_grad is None:
+            return None
+        if nvar==0:
+            mask = np.zeros(session.get_session_definition(self.a).shape)
+            mask[self.index] = my_grad
+            return mask
+        else:
+            raise RuntimeError()
+
+
+
 
 class exp_op(SingleVarOperation):
     def perform(self, session):
@@ -288,14 +335,33 @@ def sqrt_op(a):
 
 
 
-def ele_sum_op(a, dimension=0):
+class ele_sum_op(Operation):
     '''sum all elements across this dimension'''
-    if a.shape[0] is None:
-        raise TypeError('Sorry I don\'t know the number of elements across this dimension :(')
+    def __init__(self, a, dimension=0):
+        if not isinstance(dimension, int):
+            raise TypeError('Dimension must be an integer')
+        self.involvements = []
+        a.involvements.append((self, 0))
+        self.a = a
+        sh = list(a.shape)
+        if not dimension<len(sh):
+            raise ValueError('Tensor does not have this dimension - %d!' % dimension)
+        sh[dimension] = 1
+        self.shape = tuple(sh)
+        self.dim = dimension
 
-    if dimension==0:
-        c = Constant(np.ones((1, a.shape[0])))
-        return matmul_op(c, a)
+    def perform(self, session):
+        return np.sum(self.a.get_value(session), axis=self.dim)
+
+    def op_grads(self, nvar, session):
+        my_grad = self.backprop(session)
+        if my_grad is None:
+            return None
+        if nvar==0:
+            a = session.get_session_definition(self.a)
+            return my_grad*np.ones_like(a)
+        else:
+            raise RuntimeError()
 
 
 
@@ -314,6 +380,26 @@ class identity_op(SingleVarOperation):
             raise RuntimeError()
 
 
+class transpose_op(Operation):
+    def __init__(self, a):
+        self.involvements = []
+        a.involvements.append((self, 0))
+        self.a = a
+        self.shape = tuple(a.shape[::-1])
+
+
+    def perform(self, session):
+        return self.a.get_value(session).T
+
+    def op_grads(self, nvar, session):
+        my_grad = self.backprop(session)
+        if my_grad is None:
+            return None
+        if nvar==0:
+            return -my_grad
+        else:
+            raise RuntimeError()
+
 class neg_op(SingleVarOperation):
     def perform(self, session):
         return -self.a.get_value(session)
@@ -327,7 +413,13 @@ class neg_op(SingleVarOperation):
         else:
             raise RuntimeError()
 
-class relu(SingleVarOperation):
+
+
+
+# activations...
+
+
+class relu_op(SingleVarOperation):
     def perform(self, session):
         a = self.a.get_value(session)
         return np.where(a>0, a, 0.0)
@@ -342,18 +434,63 @@ class relu(SingleVarOperation):
         else:
             raise RuntimeError()
 
+class sigmoid_op(SingleVarOperation):
+    def perform(self, session):
+        a = self.a.get_value(session)
+        return expit(a)
+
+    def op_grads(self, nvar, session):
+        my_grad = self.backprop(session)
+        if my_grad is None:
+            return None
+        if nvar==0:
+            a = session.get_session_definition(self.a)
+            return my_grad*a*(1-a)
+        else:
+            raise RuntimeError()
 
 
+class tanh_op(SingleVarOperation):
+    def perform(self, session):
+        a = self.a.get_value(session)
+        return expit(a)
+
+    def op_grads(self, nvar, session):
+        my_grad = self.backprop(session)
+        if my_grad is None:
+            return None
+        if nvar==0:
+            a = session.get_session_definition(self.a)
+            return my_grad*(1.0-np.sqrt(a))
+        else:
+            raise RuntimeError()
+
+
+OPERATORS = {
+      "__add__": sum_op,
+      "__sub__": sub_op,
+      "__mul__": matmul_op,
+      "__div__": div_op,
+      "__neg__": neg_op,
+      "__getitem__": index_op
+  }
+for k, v in OPERATORS.items():
+    def wrap(func):
+        def temp(*args):
+            return func(*args)
+        return temp
+    setattr(Tensor, k, wrap(v))
 
 class Session:
     def __init__(self):
-        self._sess_defs = {}
-        self._grads = {}
+        self.reset()
 
     def get_session_definition(self, tensor):
         return self._sess_defs.get(tensor)
 
     def define_in_session(self, tensor, value):
+        if not isinstance(tensor, Placeholder):
+            raise TypeError('You can only define placeholders!')
         if isinstance(value, Tensor):
             if isinstance(value.default_value, np.ndarray):
                 val = value.default_value
@@ -369,23 +506,33 @@ class Session:
     def eval(self, tensors, defs):
         pass
 
-sess = Session()
-
-a = Placeholder((3, 1))
-
-b = Constant(np.array([[1], [2], [3]]))
-
-s = softmax_op(a)
-loss = neg_op(log_op(s))
-norm = np.random.randn
-sess.define_in_session(a, norm(3,1))
-
-print a.get_value(sess)
-print s.get_value(sess)
+    def reset(self):
+        self._sess_defs = {}
+        self._grads = {}
 
 
-sess._grads[loss] = np.array([[1], [0], [0]])
-print '---\n'
 
-print a.backprop(sess)
+
+
+if __name__=='__main__':
+    sess = Session()
+
+    a = Placeholder((3, 2))
+
+    sess.define_in_session(a, np.random.randn(3, 2))
+
+    soft = softmax_op(a)
+
+    loss = -log_op(soft[0,0]) -log_op(soft[1,1])
+
+
+    print loss.get_value(sess)
+
+    sess._grads[loss] = np.array(1)
+
+    print a.backprop(sess)
+
+
+
+
 
